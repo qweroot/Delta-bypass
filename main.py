@@ -1,500 +1,573 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# 用法: python main.py "<auth_url_or_ticket>" | ticket.txt | --generate N
-import sys
-import os
-import time
 import json
-import argparse
+import base64
+import itertools
+import random
+import string
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+import os
+import urllib.parse
+import requests
+import urllib3
+from Crypto.Cipher import AES as AES
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+try:
+    from curl_cffi import requests as cffi_requests
+    _HAS_CFFI = True
+    print("[指纹] curl_cffi 已加载，将使用 Chrome TLS 指纹伪装", flush=True)
+except ImportError:
+    _HAS_CFFI = False
+    cffi_requests = None
+    print("[指纹] 警告：curl_cffi 未安装，回退到普通请求", flush=True)
 
-import auth_client as AUTH
-import link_generator as LG
-
-FALLBACK_SERVICES = [3]
-MAX_ROUNDS = 3
-MAX_ROUNDS_HARD_CAP = 12     # 12 轮，防死循环
-POLL_MAX_ATTEMPTS = 10       # about:blank 后轮询 key 的次数
-POLL_INTERVAL = 0.1          # 每次轮询间隔(秒)
-POLL_OVERLAP_DELAY = 0.05    # step 发出后多久开始并发轮询 key(重叠掉一个 RTT)
-STEP_THROTTLE_RETRIES = 2    # 遇到限流时重试次数
-STEP_THROTTLE_SLEEP = 2.0    # 限流退避休眠(秒)
-MIN_STEP_GAP = 5.0           # 相邻两次 step 的最小间隔(秒)
-
-
-# 计时器
-class Timer:
-    # 累计各阶段耗时
-    def __init__(self):
-        self.phases = {}  # 阶段名 -> 总秒数
-        self.t0 = None
-        self.current_phase = None
-        self.invalid_reason = None   # 若求解因"无效/过期链接"终止,记录上游原因
-
-    def start(self, phase):
-        # 开始计时一个阶段
-        if self.current_phase is not None:
-            self.stop()
-        self.current_phase = phase
-        self.t0 = time.time()
-
-    def stop(self):
-        # 停止当前阶段计时
-        if self.current_phase is not None and self.t0 is not None:
-            dt = time.time() - self.t0
-            self.phases[self.current_phase] = self.phases.get(self.current_phase, 0.0) + dt
-            self.current_phase = None
-            self.t0 = None
-
-    def add(self, name, seconds):
-        # 直接添加耗时
-        self.phases[name] = self.phases.get(name, 0.0) + seconds
-
-    def total(self):
-        return sum(self.phases.values())
-
-    def summary(self):
-        parts = []
-        for name, secs in sorted(self.phases.items(), key=lambda x: -x[1]):
-            pct = secs / self.total() * 100 if self.total() > 0 else 0
-            parts.append(f"    {name}: {secs:.1f}s ({pct:.0f}%)")
-        return '\n'.join(parts)
-
-    def __repr__(self):
-        return f"Timer({self.total():.1f}s total, {len(self.phases)} phases)"
-
-
-#验证码
-# 上游已取消图形验证码环节:step 的 captcha 字段不校验(null/任意值均可),
-# 旧版 captcha 服务已换成 orbit 类型、旧识别器失效,这里不再有识别步骤。
-# The far end dropped the picture captcha (the step captcha field is not
-# checked), so there is no recognition step any more.
-
-
-#Metadata->Service解析
-def resolve_service(ticket, session=None, verbose=True):
-    #从metadata获取service及checkpointCount（决定需要多少轮/步），返回 (service, checkpointCount)
-    svc, cp, valid, reason = resolve_meta(ticket, session=session, verbose=verbose)
-    return svc, cp
-
-
-def resolve_meta(ticket, session=None, verbose=True):
-    """一次 metadata 调用同时得到 (service, checkpointCount, valid, invalid_reason)
-    """
-    cp = None
-    try:
-        meta = AUTH.get_session_metadata(ticket, session=session)
-        if isinstance(meta, dict):
-            # 明确的无效/过期判定
-            if meta.get('success') is False and not meta.get('transient'):
-                msg = str(meta.get('message') or meta.get('error') or '').lower()
-                if any(m in msg for m in AUTH.INVALID_MARKERS):
-                    reason = str(meta.get('message') or meta.get('error') or 'invalid link')
-                    if verbose:
-                        print(f'  [meta] 无效链接: {reason}', flush=True)
-                    return None, cp, False, reason
-            data = meta.get('data', meta)
-            if isinstance(data, dict):
-                profile = data.get('activeRevenueProfile', {})
-                if isinstance(profile, dict) and 'service' in profile:
-                    svc = int(profile['service'])
-                    try:
-                        cpn = profile.get('checkpointCount')
-                        cp = int(cpn) if cpn else None
-                    except (TypeError, ValueError):
-                        cp = None
-                    if verbose:
-                        dur = data.get('duration', '?')
-                        print(f'  [meta] service={svc} checkpointCount={cp} duration={dur}h', flush=True)
-                    return svc, cp, True, None
-    except Exception as e:
-        if verbose:
-            print(f'  [meta] 获取失败: {e}', flush=True)
-    return None, cp, True, None
-
-
-#Step推进
-def throttled(r):
-    # 判断 step 是否被服务器限流（"finishing checkpoints too fast" 等）
-    if not isinstance(r, dict):
-        return False
-    msg = ' '.join(str(r.get(k, '')) for k in ('message', 'error', 'detail')).lower()
-    return ('too fast' in msg) or ('slow down' in msg) or ('too many' in msg)
-
-
-def do_step_with_retry(ticket, service=None, session=None, verbose=True, timer=None,
-                       gap_state=None, overlap_poll=False, poll_session=None):
-    #执行step失败时尝试回退 遇到限流则退避后直接重试
-    services_to_try = []
-    if service is not None:
-        services_to_try.append(service)
-    for svc in FALLBACK_SERVICES:
-        if svc not in services_to_try:
-            services_to_try.append(svc)
-
-    if timer:
-        timer.start('step')
-
-    # 主动保证本链相邻step的最小间隔 避免触发限流
-    if gap_state is not None and gap_state.get('ts'):
-        gap = time.time() - gap_state['ts']
-        if gap < MIN_STEP_GAP:
-            if verbose:
-                print(f'  [step] 距上次 step 仅 {gap:.1f}s，等待 {MIN_STEP_GAP - gap:.1f}s...', flush=True)
-            time.sleep(MIN_STEP_GAP - gap)
-
-    overlap_box = {}
-    overlap_thread = None
-
-    def overlap_poll_worker():
-        #step发出后稍等一下再开始轮询,避免过早的无谓请求
-        time.sleep(POLL_OVERLAP_DELAY)
-        sess = poll_session if poll_session is not None else session
-        for _ in range(POLL_MAX_ATTEMPTS):
-            if overlap_box.get('stop'):
-                return
-            try:
-                st = AUTH.get_session_status(ticket, session=sess)
-                data = st.get('data', st) if isinstance(st, dict) else {}
-                k = data.get('key', '')
-                if k and k != 'KEY_NOT_FOUND':
-                    overlap_box['key'] = k
-                    return
-            except Exception:
-                pass
-            time.sleep(POLL_INTERVAL)
-
-    for svc in services_to_try:
-        for attempt in range(STEP_THROTTLE_RETRIES + 1):
-            try:
-                t0 = time.time()
-                if overlap_poll and overlap_thread is None:
-                    overlap_thread = threading.Thread(target=overlap_poll_worker, daemon=True)
-                    overlap_thread.start()
-                r = AUTH.do_step(ticket, service=svc, session=session)
-                dt = time.time() - t0
-                if gap_state is not None:
-                    gap_state['ts'] = time.time()
-                if isinstance(r, dict) and r.get('success'):
-                    if timer:
-                        timer.stop()
-                    if verbose:
-                        print(f'  [step] service={svc} -> 成功 ({(dt * 1000):.0f}ms)', flush=True)
-                    return svc, r, overlap_box
-                if throttled(r):
-                    if attempt < STEP_THROTTLE_RETRIES:
-                        if verbose:
-                            print(f'  [step] service={svc}: 限流，退避 {STEP_THROTTLE_SLEEP}s 后重试'
-                                  f' ({attempt + 1}/{STEP_THROTTLE_RETRIES})', flush=True)
-                        time.sleep(STEP_THROTTLE_SLEEP)
-                        continue
-                if verbose:
-                    err = json.dumps(r)[:200] if isinstance(r, dict) else str(r)[:200]
-                    print(f'  [step] service={svc}: {err} ({(dt * 1000):.0f}ms)', flush=True)
-                break
-            except Exception as e:
-                if verbose:
-                    print(f'  [step] service={svc} 异常: {e}', flush=True)
-                break
-
-    if timer:
-        timer.stop()
-    overlap_box['stop'] = True
-    return None, {'success': False, 'error': 'all services failed'}, overlap_box
-
-
-#Key提取
-def check_key_in_response(ticket, session=None, verbose=True, timer=None):
-    #检查会话中是否已有key
-    try:
-        if timer:
-            timer.start('poll')
-        st = AUTH.get_session_status(ticket, session=session)
-        if timer:
-            timer.stop()
-        st_data = st.get('data', st) if isinstance(st, dict) else {}
-        key = st_data.get('key', '')
-        if key and key != 'KEY_NOT_FOUND':
-            if verbose:
-                print(f'  [key] 发现 KEY: {key}', flush=True)
-            return key
-        if verbose and key:
-            print(f'  [key] 尚未就绪: {key}', flush=True)
-    except Exception as e:
-        if verbose:
-            print(f'  [key] 检查异常: {e}', flush=True)
-    return None
-
-
-def poll_for_key(ticket, session=None, max_attempts=3, interval=0, verbose=True, timer=None):
-    #轮询等待key：首查立即，之后每次间隔 interval 秒
-    for i in range(max_attempts):
-        key = check_key_in_response(ticket, session=session, verbose=verbose, timer=timer)
-        if key:
-            return key
-        if interval > 0 and i < max_attempts - 1:
-            time.sleep(interval)
-    return None
-
-
-#主循环
-def solve_chain(ticket, verbose=True, max_rounds=MAX_ROUNDS, session=None):
-    #完整链路ticket->captcha->step->decode->repeat->key
-    if session is None:
-        session = AUTH.create_session()
-    current_ticket = ticket
-    current_service = None
-    timer = Timer()
-    invalid_reason = [None]
-    round_cap = max(max_rounds, 1)
-    round_idx = 0
-    last_exit = ['round-exhausted']
-    gap_state = {'ts': 0.0}
-
-    while round_idx < round_cap:
-        if verbose:
-            print(f'  [{round_idx + 1}/{round_cap}]', flush=True)
-        if timer:
-            timer.start('meta')
-        meta_session = AUTH.create_session()
-        meta_future = None
-        stat_future = None
-        cpc = None
-        try:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                meta_future = pool.submit(resolve_meta, current_ticket, meta_session, verbose)
-
-                if round_idx == 0:
-                    stat_session = AUTH.create_session()
-                    stat_future = pool.submit(check_key_in_response, current_ticket,
-                                              stat_session, verbose, None)
-
-                if stat_future is not None:
-                    try:
-                        early = stat_future.result(timeout=6)
-                    except Exception:
-                        early = None
-                    if early:
-                        if verbose:
-                            print(f'  [early] 该链接已完成，直接返回已有 KEY', flush=True)
-                        return early, timer
-
-                try:
-                    svc, cpc, mvalid, mreason = meta_future.result(timeout=6)
-                    current_service = svc
-                    if not mvalid:
-                        # 明确无效/过期链接
-                        invalid_reason[0] = mreason
-                        last_exit[0] = 'invalid-link'
-                        timer.invalid_reason = mreason
-                        return None, timer
-                except Exception:
-                    current_service, cpc = None, None
-        finally:
-            meta_session.close()
-            try:
-                if stat_future is not None:
-                    stat_session.close()
-            except Exception:
-                pass
-        if timer:
-            timer.stop()
-
-        # 按 checkpointCount 动态延长轮数
-        if cpc is not None:
-            need = cpc + 1
-            if need > round_cap:
-                round_cap = min(need, MAX_ROUNDS_HARD_CAP)
-                if verbose:
-                    print(f'  [rounds] checkpointCount={cpc} -> 需 {need} 轮 (当前 cap={round_cap})', flush=True)
-
-        if current_service is not None and verbose:
-            print(f'  [service] metadata: {current_service}', flush=True)
-
-        # 对最后一步开启step/poll 重叠 两个串行RTT压成一个
-        last_step = round_idx > 0
-        service, resp, overlap = do_step_with_retry(
-            current_ticket,
-            service=current_service,
-            session=session,
-            verbose=verbose,
-            timer=timer,
-            gap_state=gap_state,
-            overlap_poll=last_step,
-            poll_session=None
-        )
-        if overlap.get('key'):
-            if verbose:
-                print(f'  [key] 发现 KEY (重叠轮询): {overlap["key"]}', flush=True)
-            return overlap['key'], timer
-        if service is None:
-            if verbose:
-                print(f'  [-] 第 {round_idx + 1} round step 全部失败, 跳过', flush=True)
-            last_exit[0] = 'step-failed'
-            round_idx += 1
-            continue
-
-        current_service = service
-        #提取URL
-        url = (resp.get('data') or {}).get('url', '')
-        if not url:
-            if verbose:
-                print(f'  [-] 响应中没有 URL', flush=True)
-            last_exit[0] = 'no-url'
-            round_idx += 1
-            continue
-
-        if verbose:
-            url_short = url[:80] + '...' if len(url) > 80 else url
-            print(f'  [url] {url_short}', flush=True)
-
-        if url == 'about:blank':
-            if verbose:
-                print(f'  [poll] (about:blank) 轮询 key, 最多 {POLL_MAX_ATTEMPTS} 次/每次{POLL_INTERVAL}s...', flush=True)
-            key = poll_for_key(current_ticket, session=session, verbose=verbose, timer=timer,
-                               max_attempts=POLL_MAX_ATTEMPTS, interval=POLL_INTERVAL)
-            if key:
-                return key, timer
-            if verbose:
-                print(f'  [-] 轮询 {POLL_MAX_ATTEMPTS} 次仍未拿到 key', flush=True)
-            last_exit[0] = 'poll-timeout'
-            round_idx += 1
-            continue
-
-        #解码r=参数->下一张ticket
-        callback = AUTH.decode_callback_url(url)
-        if callback:
-            next_ticket = AUTH.extract_ticket_from_callback(callback)
-            if next_ticket and len(next_ticket) > 50:
-                if verbose:
-                    print(f'  [next] 新 ticket: {next_ticket[:24]}... ({len(next_ticket)} chars)', flush=True)
-                current_ticket = next_ticket
-                round_idx += 1
-                continue
-
-        #无r=回调->lootlabs 链接轮询 key
-        if verbose:
-            print(f'  [info] 无 r= 回调, 尝试轮询 key...', flush=True)
-        key = check_key_in_response(current_ticket, session=session, verbose=verbose, timer=timer)
-        if key:
-            return key, timer
-        last_exit[0] = 'no-callback-no-key'
-        break
-
-    #最后检查
-    key = check_key_in_response(current_ticket, session=session, verbose=verbose, timer=timer)
-    if key:
-        return key, timer
-
-    if verbose:
-        print(f'\n[-] 未获取到 key (原因: {last_exit[0]}; 已跑 {round_idx}/{round_cap} 轮)', flush=True)
-    return None, timer
-
-
-# CLI
-def main():
-    ap = argparse.ArgumentParser(
-        description='Delta自动求解器',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''示例:
-  %(prog)s "https://auth.platorelay.com/a?d=<ticket>"
-  %(prog)s "<raw_ticket>"
-  %(prog)s ticket.txt
-  %(prog)s --generate 3
-        '''
+try:
+    from fake_useragent import UserAgent
+    UA_SOURCES = (
+        UserAgent(browsers=['Mobile Safari'], platforms='mobile'),
+        UserAgent(browsers=['Chrome Mobile'], platforms='mobile', min_version=100.0),
     )
-    ap.add_argument('target', nargs='?', help='auth URL / ticket / 文件路径')
-    ap.add_argument('--generate', '-g', type=int, default=0,
-                    help='通过 Platoboost API 生成 N 条测试链接')
-    ap.add_argument('--quiet', '-q', action='store_true',
-                    help='静默模式 (只输出结果)')
-    ap.add_argument('--max-rounds', type=int, default=MAX_ROUNDS,
-                    help=f'最大 round 数 (默认 {MAX_ROUNDS})')
-    ap.add_argument('--no-auto', action='store_true',
-                    help='只生成链接, 不求解')
-    args = ap.parse_args()
+except Exception:
+    UA_SOURCES = ()
 
-    verbose = not args.quiet
+AUTH_API = "https://auth.platorelay.com/api"
+APP_URL = "https://auth.platorelay.com/a"
+FALLBACK_VERSION = "5.4.0"
+VER_TTL = 3600.0
 
-    # 后台盯上游客户端版本：启动刷一次，之后每小时一次。
-    # Watch the far end's client version in the background: once at startup,
-    # then hourly.
-    AUTH.start_version_watcher()
+_client_version = FALLBACK_VERSION
+_client_version_at = time.time()
+_ver_lock = threading.Lock()
 
-    tickets = []
-    gen_start = time.time()
+def _env_proxy_url():
+    proxy_list = (os.environ.get('PROXY_LIST') or '').strip()
+    if proxy_list:
+        items = [p.strip() for p in proxy_list.split(',') if p.strip()]
+        if items:
+            return random.choice(items)
+    host = (os.environ.get('PROXY_HOST') or '').strip()
+    port = (os.environ.get('PROXY_PORT') or '').strip()
+    if not host or not port:
+        return None
+    user = (os.environ.get('PROXY_USERNAME') or '').strip()
+    pwd = (os.environ.get('PROXY_PASSWORD') or '').strip()
+    if user and pwd:
+        return f"http://{user}:{pwd}@{host}:{port}"
+    return f"http://{host}:{port}"
 
-    if args.generate > 0:
-        if verbose:
-            print(f'[*] 生成 {args.generate} 条链接...', flush=True)
+class _CffiResp:
+    def __init__(self, r):
+        self.status = r.status_code
+        self.data = r.content
+        self.headers = dict(r.headers)
+
+class _CffiPool:
+    def __init__(self, impersonate="chrome"):
+        self.impersonate = impersonate
+
+    def _resolve_timeout(self, timeout):
+        if timeout is None:
+            return 30
+        if hasattr(timeout, 'read') and hasattr(timeout, 'connect'):
+            return timeout.read or timeout.connect or 30
         try:
-            urls = LG.batch_links(args.generate)
-            tickets = [AUTH.extract_ticket(u) for u in urls]
-            if verbose:
-                print(f'[*] 成功获取 {len(tickets)} 条 ticket', flush=True)
-        except Exception as e:
-            print(f'[-] 生成链接失败: {e}', file=sys.stderr, flush=True)
-            sys.exit(1)
-    elif args.target:
-        # 命令行参数才允许从文件读 ticket（一行一个那种）。
-        # HTTP 接口走的是 extract_ticket，不读文件。
-        tickets.append(AUTH.extract_ticket_from_arg(args.target))
+            return float(timeout)
+        except Exception:
+            return 30
+
+    def request(self, method, url, body=None, headers=None, timeout=None, redirect=False, **kwargs):
+        t = self._resolve_timeout(timeout)
+        proxy_url = _env_proxy_url()
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        r = cffi_requests.request(
+            method=method.upper(),
+            url=url,
+            data=body,
+            headers=headers or {},
+            impersonate=self.impersonate,
+            proxies=proxies,
+            timeout=t,
+            allow_redirects=bool(redirect),
+        )
+        return _CffiResp(r)
+
+def _http_get(url, headers=None):
+    try:
+        if _HAS_CFFI:
+            r = cffi_requests.get(url, headers=headers or {}, impersonate="chrome", timeout=8)
+            if r.status_code != 200:
+                return None
+            return r.text
+        r = requests.get(url, headers=headers or {}, timeout=8)
+        if r.status_code != 200:
+            return None
+        return r.text
+    except Exception:
+        return None
+
+def _version_candidates(text):
+    found = []
+    i = 0
+    data = text
+    n = len(data)
+    while i < n:
+        if data[i] == "'":
+            j = data.find("'", i + 1)
+            if j < 0:
+                break
+            token = data[i + 1:j]
+            parts = token.split('.')
+            if (len(parts) == 3
+                    and all(p.isdigit() for p in parts)
+                    and token not in found):
+                found.append(token)
+            i = j + 1
+            continue
+        i += 1
+    return found
+
+def _version_works(version, ua):
+    letters = string.ascii_letters + string.digits
+    fake = ''.join(random.choice(letters) for _ in range(64))
+    built = build_meta_stream(fake, user_agent=ua)
+    if built is None:
+        return False
+    meta, stream = built
+    url = f"{AUTH_API}/session/step?ticket={urllib.parse.quote(fake)}&service=3"
+    body = json.dumps({"captcha": None, "meta": meta, "stream": stream, "resolved": True}).encode()
+    try:
+        r = step_pool.request('PUT', url, body=body, redirect=False, headers={
+            'User-Agent': ua,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'x-client-name': 'platoboost webclient',
+            'x-client-version': version,
+        })
+        return b'outdated client' not in r.data
+    except Exception:
+        return False
+
+def _refresh_client_version():
+    global _client_version, _client_version_at
+    try:
+        html = _http_get(APP_URL, {'User-Agent': FALLBACK_UA})
+        if not html:
+            return
+        i = html.find('/assets/index-')
+        if i < 0:
+            return
+        j = html.find('"', i)
+        if j < 0:
+            return
+        script_url = 'https://auth.platorelay.com' + html[i:j]
+
+        candidates = []
+        try:
+            if _HAS_CFFI:
+                r = cffi_requests.get(script_url, headers={
+                    'User-Agent': FALLBACK_UA, 'Range': 'bytes=0-262143'
+                }, impersonate="chrome", timeout=8)
+            else:
+                r = requests.get(script_url, headers={
+                    'User-Agent': FALLBACK_UA, 'Range': 'bytes=0-262143'
+                }, timeout=8)
+            if r.status_code in (200, 206):
+                candidates = _version_candidates(r.text)
+        except Exception:
+            pass
+        if not candidates:
+            body = _http_get(script_url, {'User-Agent': FALLBACK_UA})
+            if body:
+                candidates = _version_candidates(body)
+        if not candidates:
+            return
+
+        ua = FALLBACK_UA
+        for cand in candidates:
+            if _version_works(cand, ua):
+                global_set(cand)
+                return
+    except Exception:
+        pass
+
+def global_set(version):
+    global _client_version, _client_version_at
+    if version != _client_version:
+        print(f'[版本] 客户端版本更新: {_client_version} -> {version}', flush=True)
+    _client_version = version
+    _client_version_at = time.time()
+
+def client_version():
+    global _client_version_at
+    if time.time() - _client_version_at > VER_TTL:
+        if _ver_lock.acquire(blocking=False):
+            try:
+                if time.time() - _client_version_at > VER_TTL:
+                    _refresh_client_version()
+                    _client_version_at = time.time()
+            finally:
+                _ver_lock.release()
+    return _client_version
+
+def start_version_watcher():
+    def worker():
+        while True:
+            try:
+                _refresh_client_version()
+                _client_version_at = time.time()
+            except Exception:
+                _client_version_at = time.time()
+            time.sleep(VER_TTL)
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+MIN_TICKET_LEN = 33
+
+UA_POOL = []
+UA_IDX = itertools.count()
+UA_SCREEN = {}
+
+SCREENS_IPHONE = ('390x844', '393x852', '375x812', '414x896', '430x932', '428x926', '360x780')
+SCREENS_IPAD = ('820x1180', '834x1194', '768x1024', '744x1133', '1024x1366')
+SCREENS_ANDROID = ('360x800', '412x915', '393x873', '384x854', '360x780', '412x892', '432x960')
+
+FALLBACK_UA = ('Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) '
+               'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Mobile/15E148 Safari/604.1')
+
+def screens_for(platform, os_name):
+    p = (platform or '').lower()
+    o = (os_name or '').lower()
+    if 'ipad' in p or 'tablet' in p:
+        return SCREENS_IPAD
+    if 'iphone' in p or 'ipod' in p or 'ios' in o:
+        return SCREENS_IPHONE
+    return SCREENS_ANDROID
+
+def build_ua_pool(size=32):
+    pool = []
+    if not UA_SOURCES:
+        return [FALLBACK_UA]
+    per = max(1, size // len(UA_SOURCES))
+    for src in UA_SOURCES:
+        got = 0
+        tried = 0
+        while got < per and tried < per * 8:
+            tried += 1
+            try:
+                rec = src.getRandom
+            except Exception:
+                break
+            if not isinstance(rec, dict):
+                break
+            s = rec.get('useragent')
+            if not s or s in UA_SCREEN:
+                continue
+            cands = screens_for(rec.get('platform'), rec.get('os'))
+            UA_SCREEN[s] = cands[hash(s) % len(cands)]
+            pool.append(s)
+            got += 1
+    if not pool:
+        pool = [FALLBACK_UA]
+        UA_SCREEN.setdefault(FALLBACK_UA, SCREENS_IPHONE[0])
+    return pool
+
+def rand_ua():
+    global UA_POOL
+    if not UA_POOL:
+        UA_POOL = build_ua_pool()
+    return UA_POOL[next(UA_IDX) % len(UA_POOL)]
+
+def pick_screen(user_agent):
+    s = UA_SCREEN.get(user_agent)
+    if s:
+        return s
+    low = (user_agent or '').lower()
+    if 'ipad' in low:
+        cands = SCREENS_IPAD
+    elif 'iphone' in low or 'ipod' in low:
+        cands = SCREENS_IPHONE
     else:
-        ap.print_help()
-        sys.exit(1)
+        cands = SCREENS_ANDROID
+    return cands[hash(user_agent or '') % len(cands)]
 
-    if args.no_auto:
-        for t in tickets:
-            print(f'https://auth.platorelay.com/a?d={t}')
-        return
+def aes_ctr_encrypt(plaintext, key_bytes, iv_bytes):
+    key = bytearray(key_bytes) if isinstance(key_bytes, (bytes, bytearray)) else bytearray(key_bytes)
+    iv = bytearray(iv_bytes) if isinstance(iv_bytes, (bytes, bytearray)) else bytearray(iv_bytes)
+    data = plaintext.encode() if isinstance(plaintext, str) else plaintext
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        blk = AES.new(bytes(key), AES.MODE_ECB).encrypt(bytes(iv))
+        out += bytes(a ^ b for a, b in zip(data[i:i + 16], blk))
+        j = 15
+        while True:
+            iv[j] = (iv[j] + 1) & 0xFF
+            if iv[j] != 0:
+                break
+            j -= 1
+            if j < 0:
+                break
+    return bytes(out)
 
-    #逐条求解
-    results = []
-    for i, ticket in enumerate(tickets):
-        t0 = time.time()
-        key, timer = solve_chain(ticket, verbose=verbose, max_rounds=args.max_rounds,
-                                 session=None)
-        dt = time.time() - t0
-        results.append((i, key, timer, dt))
+def build_meta_stream(ticket, now_ms=None, user_agent=None, screen=None):
+    if len(ticket) < MIN_TICKET_LEN:
+        return None
 
-        if key:
-            print(f'\n{"=" * 60}', flush=True)
-            print(f'[+] DELTA KEY #{i + 1}: {key}', flush=True)
-            print(f'[+] 耗时: {dt:.1f}s', flush=True)
-            print(f'[+] 阶段明细:')
-            print(timer.summary())
-            print(f'{"=" * 60}', flush=True)
-        elif verbose:
-            print(f'\n[-] 链接 {i + 1}: 未获取到 key', flush=True)
-            if timer.total() > 0:
-                print(f'[-] 耗时: {dt:.1f}s')
-                print(f'[-] 阶段明细:')
-                print(timer.summary())
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    if user_agent is None:
+        user_agent = rand_ua()
+    if screen is None:
+        screen = pick_screen(user_agent)
 
-    #汇总
-    total_elapsed = time.time() - gen_start
-    success_count = sum(1 for _, key, _, _ in results if key)
-    total_timer = Timer()
-    for _, _, timer, _ in results:
-        for name, secs in timer.phases.items():
-            total_timer.add(name, secs)
+    key_meta = ticket[:16]
+    ctr_meta = ticket[16:32]
+    key_stream = ticket[1:17]
+    ctr_stream = ticket[17:33]
 
-    print(f'\n{"=" * 60}', flush=True)
-    print(f'[+] 汇总: {success_count}/{len(tickets)} 成功', flush=True)
-    print(f'[+] 总耗时: {total_elapsed:.1f}s', flush=True)
-    if len(tickets) > 0:
-        print(f'[+] 平均每链接: {total_elapsed / len(tickets):.1f}s', flush=True)
-    if total_timer.total() > 0:
-        print(f'[+] 总阶段明细:')
-        print(total_timer.summary())
-    print(f'{"=" * 60}', flush=True)
+    meta_plain = json.dumps({
+        "browserInfo": [{
+            "screen": screen,
+            "ua": user_agent,
+            "time": now_ms
+        }]
+    }, separators=(',', ':'))
 
+    stream_plain = json.dumps({
+        "events": [{"event": 1, "data": {"time": now_ms}}]
+    }, separators=(',', ':'))
 
-if __name__ == '__main__':
-    main()
+    meta = aes_ctr_encrypt(
+        meta_plain,
+        [ord(c) for c in key_meta],
+        [ord(c) for c in ctr_meta]
+    ).hex()
+
+    stream = aes_ctr_encrypt(
+        stream_plain,
+        [ord(c) for c in key_stream],
+        [ord(c) for c in ctr_stream]
+    ).hex()
+
+    return meta, stream
+
+def extract_ticket(arg):
+    t = arg.strip()
+    if t.startswith('http'):
+        parsed = urllib.parse.urlparse(t)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if 'd' in qs:
+            return qs['d'][0]
+        return t
+    return t
+
+def extract_ticket_from_arg(arg):
+    t = arg.strip()
+    if t.startswith('http'):
+        return extract_ticket(t)
+    if t.endswith('.txt') or '/' in t or '\\' in t:
+        try:
+            with open(t) as f:
+                content = f.read().strip()
+                if content:
+                    return extract_ticket_from_arg(content)
+        except (IOError, OSError):
+            pass
+    return t
+
+def decode_callback_url(loot_url):
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(loot_url).query)
+    r_param = qs.get('r', [''])[0]
+    if not r_param:
+        return None
+    b64 = r_param.replace('-', '+').replace('_', '/')
+    padding = (4 - len(b64) % 4) % 4
+    try:
+        dec = base64.b64decode(b64 + '=' * padding).decode('utf-8')
+        if dec.startswith('http'):
+            return dec
+    except Exception:
+        pass
+    return None
+
+def extract_ticket_from_callback(callback_url):
+    if not callback_url:
+        return None
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(callback_url).query)
+    return qs.get('d', [None])[0]
+
+if _HAS_CFFI:
+    step_pool = _CffiPool(impersonate="chrome")
+else:
+    _proxy_url = _env_proxy_url()
+    if _proxy_url:
+        step_pool = urllib3.ProxyManager(
+            _proxy_url, num_pools=8, maxsize=64, block=False, retries=False,
+            timeout=urllib3.Timeout(connect=3.0, read=8.0),
+        )
+    else:
+        step_pool = urllib3.PoolManager(
+            num_pools=8, maxsize=64, block=False, retries=False,
+            timeout=urllib3.Timeout(connect=3.0, read=8.0),
+        )
+
+def create_session():
+    s = requests.Session()
+    s.headers.update({
+        'User-Agent': rand_ua(),
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/plain, */*',
+    })
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=8, pool_maxsize=32, max_retries=0)
+    s.mount('http://', adapter)
+    s.mount('https://', adapter)
+    return s
+
+def do_step(ticket, service=3, session=None, now_ms=None):
+    step_ua = rand_ua()
+    built = build_meta_stream(ticket, now_ms, user_agent=step_ua)
+    if built is None:
+        return {"success": False,
+                "error": f"ticket 长度不足（{len(ticket)} 字符，至少要 {MIN_TICKET_LEN} 个）"}
+    meta, stream = built
+
+    url = f"{AUTH_API}/session/step?ticket={urllib.parse.quote(ticket)}&service={service}"
+
+    body = json.dumps({
+        "captcha": None,
+        "meta": meta,
+        "stream": stream,
+        "resolved": True
+    }).encode()
+
+    STEP_HTTP_RETRIES = 3
+    STEP_RETRY_SLEEP = 0.5
+    last_err = None
+    for attempt in range(STEP_HTTP_RETRIES + 1):
+        try:
+            r = step_pool.request('PUT', url, body=body, redirect=False, headers={
+                'User-Agent': step_ua,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json, text/plain, */*',
+                'x-client-name': 'platoboost webclient',
+                'x-client-version': client_version()
+            })
+            if r.status != 200:
+                last_err = f"http {r.status}"
+                if attempt < STEP_HTTP_RETRIES:
+                    time.sleep(STEP_RETRY_SLEEP)
+                    continue
+                return {"success": False, "error": last_err}
+            try:
+                return json.loads(r.content)
+            except Exception:
+                last_err = "non-json response"
+                if attempt < STEP_HTTP_RETRIES:
+                    time.sleep(STEP_RETRY_SLEEP)
+                    continue
+                return {"success": False, "error": last_err}
+        except Exception as e:
+            last_err = str(e)
+            if attempt < STEP_HTTP_RETRIES:
+                time.sleep(STEP_RETRY_SLEEP)
+                continue
+            return {"success": False, "error": last_err}
+    return {"success": False, "error": last_err or "step failed"}
+
+def get_json(path_qs, retries=3, sleep=0.25):
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = step_pool.request('GET', f"{AUTH_API}/{path_qs}",
+                redirect=False,
+                headers={'User-Agent': rand_ua(), 'Accept': 'application/json'})
+            if r.status != 200:
+                last_err = f"http {r.status}"
+                if attempt < retries:
+                    time.sleep(sleep)
+                    continue
+                return {"success": False, "error": last_err, "transient": True}
+            try:
+                return json.loads(r.content)
+            except Exception:
+                last_err = "non-json response"
+                if attempt < retries:
+                    time.sleep(sleep)
+                    continue
+                return {"success": False, "error": last_err, "transient": True}
+        except Exception as e:
+            last_err = str(e)
+            if attempt < retries:
+                time.sleep(sleep)
+                continue
+            return {"success": False, "error": last_err, "transient": True}
+    return {"success": False, "error": last_err or "get failed", "transient": True}
+
+def get_session_status(ticket, session=None):
+    return get_json(f"session/status?ticket={urllib.parse.quote(ticket)}")
+
+def get_session_metadata(ticket, session=None):
+    return get_json(f"session/metadata?ticket={urllib.parse.quote(ticket)}")
+
+INVALID_MARKERS = ('invalid payload', 'expired', 'not found', 'invalid session',
+                     'invalid ticket', 'does not exist')
+
+def check_ticket_valid(ticket, session=None):
+    try:
+        meta = get_session_metadata(ticket, session=session)
+    except Exception:
+        return True, None
+    if not isinstance(meta, dict):
+        return True, None
+    if meta.get('success') is True:
+        return True, None
+    if meta.get('transient'):
+        return True, None
+    if meta.get('success') is False:
+        msg = str(meta.get('message') or meta.get('error') or '').lower()
+        if any(m in msg for m in INVALID_MARKERS):
+            return False, str(meta.get('message') or meta.get('error') or 'invalid link')
+        return True, None
+    return True, None
+
+# ================= 下面是缺失的 FastAPI 接口代码 =================
+app = FastAPI()
+
+@app.on_event("startup")
+def startup_event():
+    start_version_watcher()
+
+@app.get("/health")
+@app.get("/healthz")
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
+
+@app.get("/delta")
+def delta(url: str = Query(...)):
+    ticket = extract_ticket_from_arg(url)
+    if not ticket or len(ticket) < MIN_TICKET_LEN:
+        return {"key": None, "error": "invalid url (no ticket)"}
+
+    valid, err = check_ticket_valid(ticket)
+    if not valid:
+        return {"key": None, "error": err or "expired link"}
+
+    result = do_step(ticket)
+    if isinstance(result, dict):
+        if result.get("success") is True and result.get("key"):
+            return {"key": result["key"], "error": None}
+        if result.get("key"):
+            return {"key": result["key"], "error": None}
+        err_msg = str(result.get("error", ""))
+        return {"key": None, "error": err_msg}
+
+    return {"key": None, "error": "solve failed"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
