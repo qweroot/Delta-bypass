@@ -12,7 +12,7 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from typing import List
 
-HOST = "delta-solve.app.workbuddy.host"
+HOST = "bypass.lat"
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 FRAME_DATA = 0x0
 FRAME_HEADERS = 0x1
