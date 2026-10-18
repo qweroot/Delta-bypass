@@ -12,7 +12,9 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from typing import List
 
-HOST = "delta-solve.app.workbuddy.host"
+HOST = "bypass.lat"
+PORT = 443
+BASE_PATH = "/BETA-BYPASS"
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 FRAME_DATA = 0x0
 FRAME_HEADERS = 0x1
@@ -246,10 +248,10 @@ class H2Client(object):
 
 def _hdrs(path, vid):
     fp = random.choice(FPS)
-    return [(":method", "GET"), (":scheme", "https"), (":authority", HOST), (":path", path),("user-agent", random.choice(UAS)),("x-client-info", urllib.parse.quote(json.dumps(fp, separators=(",", ":")))),("accept", "application/json"),("accept-language", "zh-CN,zh-Hans;q=0.9"),("referer", "https://%s/" % HOST),("origin", "https://%s" % HOST),("sec-fetch-site", "same-origin"),("sec-fetch-mode", "cors"),("sec-fetch-dest", "empty"),("priority", "u=1, i"),("cookie", "ds_vid=" + vid)]
+    return [(":method", "GET"), (":scheme", "https"), (":authority", HOST), (":path", BASE_PATH + path),("user-agent", random.choice(UAS)),("x-client-info", urllib.parse.quote(json.dumps(fp, separators=(",", ":")))),("accept", "application/json"),("accept-language", "zh-CN,zh-Hans;q=0.9"),("referer", "https://%s%s/" % (HOST, BASE_PATH)),("origin", "https://%s" % HOST),("sec-fetch-site", "same-origin"),("sec-fetch-mode", "cors"),("sec-fetch-dest", "empty"),("priority", "u=1, i"),("cookie", "ds_vid=" + vid)]
 
 def _one_request(path, vid, timeout=25):
-    c = H2Client(HOST, timeout=timeout)
+    c = H2Client(HOST, PORT, timeout=timeout)
     try:
         c.connect()
     except Exception as e:
